@@ -378,6 +378,7 @@ CONFIG_FILE_DEFAULT="$BOT_DIR_DEFAULT/config.php"
 GIT_REPO="Kernel-D3v/mirzabot"
 LATEST_CACHE="/tmp/.mirza_latest_version"
 IP_CACHE="/tmp/.mirza_server_ip"
+IP6_CACHE="/tmp/.mirza_server_ip6"
 
 # ── Resumable-install state engine ───────────────────────────
 # Survives reboots / network drops. Lets a failed install resume
@@ -1145,12 +1146,25 @@ get_server_ip() {
         return
     fi
     local ip
-    ip=$(curl -fsSL --max-time 4 ifconfig.me 2>/dev/null)
-    [ -z "$ip" ] && ip=$(curl -fsSL --max-time 4 https://api.ipify.org 2>/dev/null)
-    [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    # IPv4 only: DNS A records are IPv4, so an IPv6 answer here can never match them.
+    ip=$(curl -4 -fsSL --max-time 4 ifconfig.me 2>/dev/null)
+    [ -z "$ip" ] && ip=$(curl -4 -fsSL --max-time 4 https://api.ipify.org 2>/dev/null)
+    [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
     [ -z "$ip" ] && ip="n/a"
     echo "$ip" > "$IP_CACHE"
     echo "$ip"
+}
+
+# Get public IPv6 of this server, or empty when it has none (+ cached for 1 hour)
+get_server_ip6() {
+    if [ -f "$IP6_CACHE" ] && [ $(( $(date +%s) - $(stat -c %Y "$IP6_CACHE" 2>/dev/null || echo 0) )) -lt 3600 ]; then
+        cat "$IP6_CACHE"
+        return
+    fi
+    local ip6
+    ip6=$(curl -6 -fsSL --max-time 4 ifconfig.me 2>/dev/null)
+    echo "$ip6" > "$IP6_CACHE"
+    printf '%s' "$ip6"
 }
 
 # ── Dashboard sections ───────────────────────────────────────
@@ -1823,13 +1837,57 @@ validate_domain() { [[ "$1" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+
 
 # 0 = points here, 1 = points elsewhere, 2 = could not resolve
 domain_points_here() {
-    local dom="$1" myip resolved
+    local dom="$1" myip myip6 a aaaa
     myip=$(get_server_ip)
-    resolved=$(getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1; exit}')
-    [ -z "$resolved" ] && resolved=$(getent hosts "$dom" 2>/dev/null | awk '{print $1; exit}')
-    [ -z "$resolved" ] && return 2
-    [ "$resolved" = "$myip" ] && return 0
+    # Compare like with like: A records against the IPv4, AAAA records against the IPv6.
+    a=$(getent ahostsv4 "$dom" 2>/dev/null | awk '{print $1}' | sort -u)
+    aaaa=$(getent ahostsv6 "$dom" 2>/dev/null | awk '{print $1}' | grep ':' | sort -u)
+    [ -z "$a$aaaa" ] && return 2
+    if [ -n "$a" ] && [ -n "$myip" ] && [ "$myip" != "n/a" ] && printf '%s\n' "$a" | grep -qxF "$myip"; then
+        return 0
+    fi
+    myip6=$(get_server_ip6)
+    if [ -n "$aaaa" ] && [ -n "$myip6" ] && printf '%s\n' "$aaaa" | grep -qxF "$myip6"; then
+        return 0
+    fi
     return 1
+}
+
+# Credentials file for DNS-01 issuance, used when inbound port 80 is unusable.
+cert_dns_credentials_file() {
+    local f
+    for f in /root/.secrets/cloudflare.ini /root/.secrets/dns.ini; do
+        if [ -r "$f" ]; then printf '%s' "$f"; return 0; fi
+    done
+    return 1
+}
+
+# Issue a certificate without any inbound port (DNS-01). Returns 1 when unavailable.
+issue_cert_dns01() {
+    local dom="$1" creds
+    if ! creds=$(cert_dns_credentials_file); then
+        echo "No DNS credentials found (expected /root/.secrets/cloudflare.ini) - skipping DNS-01." >&2
+        return 1
+    fi
+    if ! python3 -c 'import certbot_dns_cloudflare' >/dev/null 2>&1; then
+        apt install -y python3-certbot-dns-cloudflare >>"${INSTALL_LOG:-/dev/null}" 2>&1 || return 1
+    fi
+    certbot certonly --dns-cloudflare --dns-cloudflare-credentials "$creds" \
+        --non-interactive --agree-tos --register-unsafely-without-email \
+        --cert-name "$dom" -d "$dom" >>"${INSTALL_LOG:-/dev/null}" 2>&1
+}
+
+# Explain a failed HTTP-01 challenge in terms of what the operator must change.
+ssl_explain_http01_failure() {
+    if grep -qiE 'Timeout during connect|firewall' "${INSTALL_LOG:-/dev/null}" 2>/dev/null; then
+        echo -e " ${C_WARN}!${CR} ${C_WARN}Let's Encrypt could not reach this server on port 80 from the internet.${CR}"
+        echo -e " ${C_DIM}If no local firewall is dropping it, the port is blocked upstream - open inbound TCP 80 and${CR}"
+        echo -e " ${C_DIM}443 in your provider panel, then retry. Only 80 is needed to issue; 443 is needed to serve.${CR}"
+        echo -e " ${C_DIM}Or issue over DNS, which needs no inbound port:${CR}"
+        echo -e " ${C_DIM}  certbot certonly --dns-cloudflare --dns-cloudflare-credentials /root/.secrets/cloudflare.ini \\${CR}"
+        echo -e " ${C_DIM}    --cert-name $DOMAIN_NAME -d $DOMAIN_NAME${CR}"
+        echo -e " ${C_DIM}An existing certificate is reused, so re-running this installer then continues.${CR}"
+    fi
 }
 
 # 0 = valid+live, 1 = bad format, 2 = format ok but token rejected/unreachable
@@ -2382,9 +2440,20 @@ function install_bot() {
             run_step "Installing Let's Encrypt (certbot)" "apt install $_cb_pkg -y && systemctl enable certbot.timer" \
                 || { show_step_error; install_pause "Installing certbot"; }
 
-            run_step "Requesting SSL certificate (Let's Encrypt)" \
-                "certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email --preferred-challenges http -d $DOMAIN_NAME" \
-                || { show_step_error; install_pause "Requesting SSL certificate"; }
+            # HTTP-01 needs inbound port 80. Where the provider drops it upstream (common on
+            # NAT-style VPS plans) fall back to DNS-01 when credentials exist, else explain it.
+            if ! run_step "Requesting SSL certificate (Let's Encrypt)" \
+                "certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email --preferred-challenges http -d $DOMAIN_NAME"; then
+                show_step_error
+                ssl_explain_http01_failure
+                if run_step "Requesting SSL certificate (DNS-01)" "issue_cert_dns01 '$DOMAIN_NAME'"; then
+                    echo -e " ${C_OK}●${CR} ${C_OK}Certificate issued over DNS - no inbound port was needed.${CR}"
+                    echo -e " ${C_DIM}Public HTTPS still needs inbound TCP 443 open at your provider.${CR}"
+                else
+                    show_step_error
+                    install_pause "Requesting SSL certificate"
+                fi
+            fi
         fi
         run_step "Enabling & starting Apache" "systemctl enable apache2 && systemctl start apache2" \
             || { show_step_error; install_pause "Starting Apache"; }
